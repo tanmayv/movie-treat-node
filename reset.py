@@ -13,7 +13,7 @@ def computeMD5hash(string):
     return m.hexdigest()
 
 mydb.users.insert_one({
-    "username" : "tanmay",
+    "_id" : "tanmay",
     "password" : computeMD5hash("tanmay"),
     "moderator" : True,
     "profile_url" : "http://localhost:5000/_uploads/photos/icon_3.png"
