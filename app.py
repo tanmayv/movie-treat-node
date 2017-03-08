@@ -335,7 +335,7 @@ def createActivity(userImage, username, verb,moviename, rating):
     })
 if __name__ == '__main__':
     init_user_rating_matrix()
-    app.run()
+    app.run(host='0.0.0.0', debug = False)
 
 
 def isInArray(source, target, id1, id2):
