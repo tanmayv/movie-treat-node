@@ -6,9 +6,10 @@ import datetime
 import hashlib
 from flask_uploads import (UploadSet, configure_uploads, IMAGES,
                               UploadNotAllowed)
+from sklearn.cluster import KMeans
 import numpy as np
-from sklearn.decomposition import ProjectedGradientNMF
-
+import sys
+import pyfpgrowth
 # App
 
 UPLOADED_PHOTOS_DEST = '/tmp/photolog'
@@ -18,6 +19,8 @@ app = Flask(__name__, static_url_path='')
 
 
 # Global Vars
+omdb.api._client.params_map['apikey'] = 'apikey'
+omdb.set_default('apikey', '26029d08')
 photos = UploadSet('photos', IMAGES,default_dest=lambda app:app.instance_path)
 configure_uploads(app, photos)
 count = 0
@@ -28,12 +31,20 @@ mydb = client['movie_database']
 user_rating_matrix = []
 movie_index_dict = {}
 user_index_dict = {}
+transactions = []
+genres = []
+lastCall = 0;
+recommendation = {
+    "predicted_numpy_matrix" : np.array(user_rating_matrix)
+}
+
 
 def init_user_rating_matrix():
     user_rating_cursor = mydb.user_ratings.find()
 
     for user_rating_item in user_rating_cursor:
         insert_into_matrix(user_rating_item.get("user_id"), user_rating_item.get("movie_id"), user_rating_item.get("rating"))
+    print "[info] Loading initial user matrix complete"
 
 def convert_to_numpy(list_matrix):
     max_len = len(max(list_matrix,key=len))
@@ -48,6 +59,42 @@ def key_from_value(value, dict):
     for key in dict.keys():
         if(dict.get(key) == value):
             return key
+
+def matrix_factorization(R, P, Q, K, steps=5000, alpha=0.0002, beta=0.02):
+    Q = Q.T
+    for step in xrange(steps):
+        for i in xrange(len(R)):
+            for j in xrange(len(R[i])):
+                if R[i][j] > 0:
+                    eij = R[i][j] - np.dot(P[i,:],Q[:,j])
+                    for k in xrange(K):
+                        P[i][k] = P[i][k] + alpha * (2 * eij * Q[k][j] - beta * P[i][k])
+                        Q[k][j] = Q[k][j] + alpha * (2 * eij * P[i][k] - beta * Q[k][j])
+        eR = np.dot(P,Q)
+        e = 0
+        for i in xrange(len(R)):
+            for j in xrange(len(R[i])):
+                if R[i][j] > 0:
+                    e = e + pow(R[i][j] - np.dot(P[i,:],Q[:,j]), 2)
+                    for k in xrange(K):
+                        e = e + (beta/2) * (pow(P[i][k],2) + pow(Q[k][j],2))
+        if e < 0.001:
+            break
+    return P, Q.T
+def predict_numpy_matrix():
+    print "[info] Predictng numpy matrix"
+
+    R = convert_to_numpy(user_rating_matrix)
+    N = len(R)
+    M = len(R[0])
+    K = 5
+    P = np.random.rand(N,K)
+    Q = np.random.rand(M,K)
+    nP, nQ = matrix_factorization(R, P, Q, K)
+    nR = np.dot(nP, nQ.T)
+    nR = np.around(nR, decimals = 3)
+    recommendation["predicted_numpy_matrix"] = nR
+    print "[Done] Predictng numpy matrix"
 
 def insert_into_matrix(user_id, movie_id, rating):
     matrix_len = len(user_rating_matrix)
@@ -74,7 +121,6 @@ def get_item_index(item_id, dict):
     if item_id in dict.keys():
         return dict[item_id]
     else:
-
         current_length = len(dict)
         dict[item_id] = current_length
         return current_length
@@ -89,8 +135,11 @@ def index():
 
 @app.route('/login', methods=['POST'])
 def login():
+    print "I do came here.."
     content = request.get_json(force=True)
+    print request
     print content
+
     username = content.get("username", None)
     password = content.get("password", None)
     password = computeMD5hash(password)
@@ -175,25 +224,42 @@ def saveMovie(id):
 
 @app.route('/recommend/<string:id>')
 def recommend(id):
-    A = convert_to_numpy(user_rating_matrix)
-    nmf_model = ProjectedGradientNMF(n_components = 5, init='random', random_state=0)
-    W = nmf_model.fit_transform(A);
-    H = nmf_model.components_;
-
+    global lastCall
+    lastCall += 1
     i = get_item_index(id, user_index_dict)
-    nR = np.dot(W, H)
+    if i >= len(user_rating_matrix):
+        return jsonify({"movies":[], "message" : "Insufficient movies"})
+    print str(i) + " <<>> " + str(len(recommendation["predicted_numpy_matrix"]) )
+
+    print str(lastCall) + " <<LastCall>> "
+    if(lastCall % 10 == 0 or i >= len(recommendation["predicted_numpy_matrix"])):
+        print "Re Calculating"
+        predict_numpy_matrix()
+    else:
+        print "Re Using"
+    nR = recommendation["predicted_numpy_matrix"]
+
     a = nR[i].tolist()
-    max_i =  np.argsort(a)[::-1][:5]
-    result = {}
+    max_i =  np.argsort(a)[::-1]
+    result = []
     max_i = max_i.tolist()
+    total_movies = 0
+    for index in max_i:
+        if total_movies > 5:
+            break
+        if user_rating_matrix[i][index] == 0:
 
-    index = len(max_i);
-    while index > 0:
-        print a[index - 1]
-        result[key_from_value(index -1 , movie_index_dict)] = a[index - 1]
-        index = index - 1
+            if a[index] > 2.5:
+                total_movies = total_movies + 1
+                movie_id = key_from_value(index, movie_index_dict)
+                movie = mydb.movies.find_one({"_id" : movie_id})
+                if a[index] > 5:
+                    movie["predicted_rating"] = 5
+                else:
+                    movie["predicted_rating"] = a[index]
+                result.append(movie)
 
-    return jsonify(result)
+    return jsonify({"movies" : result})
 @app.route('/delete_movie/<string:id>')
 def deleteMovie(id):
     result = mydb.movies.find({"_id" : id})
@@ -240,14 +306,128 @@ def get_users(page_no ):
         result.append(user)
     return jsonify({"count": get_users_count(), "users": result})
 
+@app.route('/fpRecommender/<string:id>')
+def getFPRecommendations(id):
+    enrichedRecList = []
+    minsup = 3
+    if request.args and request.args.get("minsup"):
+        minsup = request.args.get("minsup")
+
+    recommendations = fpRecommender(id, int(minsup))
+    movies_sample = []
+    for recommendation in recommendations:
+        enrichedRec = []
+        for movie in recommendation.get("reason", []):
+            enrichedRec.append(mydb.movies.find_one({"_id" : movie})["title"])
+        if(len(enrichedRec) > 1):
+            enrichedRecList.append({
+                "reason" : enrichedRec,
+                "movies" : recommendation.get("movies", [])
+            })
+        movies_sample = concatWithoutDuplicates(movies_sample, recommendation.get("movies", []))
+    print movies_sample
+    enrichedMoviesSample = []
+    for movie in movies_sample:
+        enrichedMoviesSample.append(mydb.movies.find_one({"_id" : movie}))
+    labels =  formClusters(n_cl = 2, movies = enrichedMoviesSample).labels_
+    return jsonify({"recommendation" : enrichedRecList, "movie_sample" : enrichedMoviesSample, "labels" : labels.tolist()})
+
+@app.route('/similar/<string:id>')
+def getSimilar(id):
+    movies_c = mydb.movies.find();
+    movie_sample = []
+    index = 0;
+    i = 0;
+    for movie in movies_c:
+        if movie["_id"] == id:
+            index = i
+            print "selected index " + str(index)
+        i += 1
+        movie_sample.append(movie)
+
+    print i;
+    n_c = i/5;
+    print n_c
+    labels = formClusters(n_cl = n_c, movies = movie_sample).labels_
+    print labels
+    class_m = labels[index]
+    result = []
+    i = 0
+    for l in labels:
+        if l == class_m and index != i:
+            result.append(movie_sample[i])
+        i += 1
+
+    return jsonify(result)
+
+def concatWithoutDuplicates(list1, list2):
+    return list1 + list(set(list2) - set(list1))
+
+def updateTransactions(minsup):
+    transactions = []
+    users = mydb.users.find();
+    for user in users:
+        movie_id_list = [];
+        ratings = mydb.user_ratings.find({"user_id" : user.get("_id"), "rating" : {"$gt" : 2.9}})
+        for rating in ratings:
+            movie_id_list.append(rating.get("movie_id"))
+        if(len(movie_id_list) > 0):
+            transactions.append(movie_id_list)
+    size = 0;
+    itemsets = pyfpgrowth.find_frequent_patterns(transactions, minsup)
+    patterns = []
+    for itemset in itemsets:
+        if(len(itemset) > 1):
+            patterns.append(itemset)
+
+    return patterns
+
+
+def intersect(a, b):
+    return list(set(a) & set(b))
+
+def difference(a,b):
+    return list(set(a).symmetric_difference(set(b)))
+
+def fpRecommender(user_id, minsup):
+    ratings = mydb.user_ratings.find({"user_id" : user_id, "rating" : {"$gt" : 2.9}})
+    user_movies = []
+    recommended_movies = []
+    for rating in ratings:
+        user_movies.append(rating.get("movie_id"))
+    patterns = updateTransactions(minsup)
+    for pattern in patterns:
+        intersection = intersect(user_movies, pattern)
+        if(len(intersection) > 0 and len(intersection) < len(pattern)):
+
+            print float(len(intersection))/len(pattern)
+            if(float(len(intersection))/len(pattern) > 0.4):
+                diff = difference(pattern, intersection)
+                recommendation = {
+                    "reason" : intersection,
+                    "movies" : diff
+                }
+                recommended_movies.append(recommendation)
+    return recommended_movies
+
+
+
+
+@app.route('/movie/<string:id>')
+def get_movie(id):
+    movie = mydb.movies.find_one({"_id" : id})
+    return jsonify(movie)
 @app.route('/search_movies')
 def search_movies():
     search_string = ""
+    response = []
     print "hello"
     if request.args and request.args.get("s"):
         search_string = request.args.get("s")
+        auto_store = request.args.get("auto_store")
+
         result = omdb.search_movie(search_string)
-        response = []
+
         for movie in result:
             try:
                 print movie.title
@@ -255,14 +435,23 @@ def search_movies():
                 if movie["poster"].endswith(".jpg"):
                     response.append(movie)
                     alreadyExists = mydb.movies.find({"_id" : movie["imdb_id"]})
-
-                    if count_iterable(alreadyExists) > 0:
+                    alreadyExists = count_iterable(alreadyExists) > 0
+                    if(not alreadyExists and auto_store == "1"):
+                        print "going to save a movie " + movie["_id"]
+                        movieInfo = omdb.imdbid(movie["_id"])
+                        movieInfo["_id"] = movieInfo["imdb_id"]
+                        movieInfo["time_stamp"] = datetime.datetime.now().isoformat();
+                        mydb.movies.insert_one(movieInfo)
+                        print movieInfo.title +" Inserted!"
+                        calculate_movies_count();
+                    if alreadyExists:
                         movie.stored = "true";
                     else:
                         movie.stored = "false";
 
-            except Exception:
-                pass
+            except Exception as e:
+                print "Exception has occured"
+                print str(e)
     return jsonify(response)
 
 
@@ -333,9 +522,47 @@ def createActivity(userImage, username, verb,moviename, rating):
         "rating" : rating,
         "time_stamp" : datetime.datetime.now().isoformat()
     })
+def transformMovie(movie):
+    movie_genre = movie["genre"].split(", ")
+    #Sci-Fi, Crime, Mystery, Thriller, Action, Comedy , Adventure, Drama, Horror, Family Short Animation rating, year, runtime
+    movie_t = []
+    genres = ["Sci-Fi", "Crime", "Thriller", "Action", "Comedy","Adventure","Drama","Horror","Family","Short","Animation"]
+    for genre in genres:
+        if(genre in movie_genre):
+            movie_t.append(1)
+        else:
+            movie_t.append(0)
+
+    if movie["imdb_rating"] != "N/A":
+        movie_t.append(float(movie["imdb_rating"])/ 10)
+    else:
+        movie_t.append(0)
+    movie_t.append(int(movie["year"]) / 2017)
+    if movie["runtime"] != "N/A":
+        movie_t.append(int(movie["runtime"].split(" ")[0])/ 160)
+    else:
+        movie_t.append(0)
+
+    return movie_t
+
+def formClusters(n_cl = 2,movies = []):
+    movies_a = []
+    for movie in movies:
+        movies_a.append(transformMovie(movie))
+
+    x = np.array(movies_a)
+
+    kmeans = KMeans(n_clusters=n_cl, random_state=0).fit(x)
+    return kmeans
+
+
 if __name__ == '__main__':
     init_user_rating_matrix()
-    app.run(host='0.0.0.0', debug = False)
+    #updateTransactions()
+    app.run(host='0.0.0.0', debug = True)
+
+
+
 
 
 def isInArray(source, target, id1, id2):
